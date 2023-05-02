@@ -1,0 +1,606 @@
+import os
+import binance
+from binance.client import Client
+from binance.enums import *
+from binance.exceptions import *
+from binance.websockets import BinanceSocketManager
+from datetime import datetime, timedelta
+import numpy as np
+import talib
+
+# Binance API keys
+api_key = ''
+api_secret = 'J'
+
+client = Client(api_key, api_secret, {"base_url": "https://api.binance.com/api/v3"})
+# Define trading parameters
+symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+interval = Client.KLINE_INTERVAL_5MINUTE
+
+# Define buy/sell parameters
+buy_qty = 0.01
+sell_qty = 0.01
+profit_threshold = 1.02
+stop_loss_threshold = 0.98
+
+# Define pair switching parameters
+switch_interval = 10
+switch_profit_threshold = 1.01
+
+# Define moving average parameters
+short_ma_period = 20
+long_ma_period = 50
+
+# Define Bollinger Bands parameters
+bb_period = 20
+bb_std_dev = 2
+
+
+class BinanceBot:
+    def __init__(self, api_key, api_secret, symbol, interval, trade_allocation, stop_loss, take_profit):
+        self.client = Client(api_key, api_secret)
+        self.symbol = symbol
+        self.interval = interval
+        self.trade_allocation = trade_allocation
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.current_prices = {}
+        self.buy_order_ids = {}
+        self.sma_period = 20
+        self.std_dev_multiplier = 2
+        self.bollinger_bands_period = 20
+        self.bollinger_bands_upper = None
+        self.bollinger_bands_lower = None
+        self.bollinger_bands_middle = None
+        self.running = False
+        self.bsm = None
+        self.rsi_threshold=30
+
+    def start(self):
+        self.running = True
+        self.__calculate_bollinger_bands()
+        self.__start_kline_socket()
+        self.__start_trade_socket()
+
+    def stop(self):
+        self.running = False
+        self.bsm.close()
+
+    def __start_kline_socket(self):
+        def process_kline_data(msg):
+            if msg['e'] != 'error':
+                kline = msg['k']
+                if kline['x']:
+                    close_price = float(kline['c'])
+                    self.current_prices[self.symbol] = close_price
+                    if self.__is_sell_signal():
+                        self.__place_market_sell_order()
+                    elif self.__is_buy_signal():
+                        self.__place_market_buy_order()
+                else:
+                    print(f"received kline with event time {kline['t']}")
+
+        self.bsm = BinanceSocketManager(self.client)
+        self.bsm.start_kline_socket(self.symbol, process_kline_data, interval=self.interval)
+        self.bsm.start()
+
+    def __start_trade_socket(self):
+        def process_trade_data(msg):
+            if msg['e'] != 'error':
+                trade = msg['t']
+                if trade['s'] == self.symbol:
+                  print("Trade update for {}: price {}".format(self.symbol, price))
+
+                  self.current_prices[self.symbol] = float(trade['p'])
+                  if self.__is_sell_signal():
+                        self.__place_market_sell_order()
+                elif self.__is_buy_signal():
+                        self.__place_market_buy_order()
+
+        self.bsm.start_trade_socket(self.symbol, process_trade_data)
+        self.bsm.start()
+
+    def __calculate_bollinger_bands(self):
+        klines = self.client.get_historical_klines(self.symbol, self.interval, "1000 minutes ago UTC")
+        close_prices = [float(kline[4]) for kline in klines]
+        upper, middle, lower = talib.BBANDS(np.array(close_prices), timeperiod=self.bollinger_bands_period,
+                                            nbdevup=self.std_dev_multiplier, nbdevdn=self.std_dev_multiplier,
+                                            matype=talib.MA_Type.T3)
+        self.bollinger_bands_upper = upper[-1]
+        self.bollinger_bands_lower = lower[-1]
+        self.bollinger_bands_middle = middle[-1]
+
+    def __is_buy_signal(self):
+        if self.current_prices[self.symbol] < self.bollinger_bands_lower:
+            return True
+        return False
+
+    def __is_sell_signal(self):
+        if self.current_prices[self.symbol] > self.bollinger_bands_upper:
+            return True
+        return False
+
+    def __place_market_buy_order(self):
+        try:
+            order = self.client.order_market_buy(
+                symbol=self.symbol,
+                quantity=self.trade_allocation / self.current_prices[self.symbol]
+            )
+            print(f"Market buy order for {self.symbol} placed at {self.current_prices[self.symbol]}")
+            self.buy_order_ids[order['orderId']] = self.current_prices[self.symbol]
+        except BinanceAPIException as e:
+            print(f"Error placing market buy order: {e}")
+
+    def __place_market_sell_order(self):
+        try:
+            quantity = self.client.get_asset_balance(asset=self.symbol[:3])['free']
+            order = self.client.order_market_sell(
+                symbol=self.symbol,
+                quantity=quantity
+            )
+            print(f"Market sell order for {self.symbol} placed at {self.current_prices[self.symbol]}")
+            del self.buy_order_ids[order['orderId']]
+        except BinanceAPIException as e:
+            print(f"Error placing market sell order: {e}")
+
+    def __get_stop_loss_price(self, buy_price):
+        return buy_price * self.stop_loss
+
+    def __get_take_profit_price(self, buy_price):
+        return buy_price * self.take_profit
+
+    def __update_stop_loss(self, order_id):
+        try:
+            order = self.client.get_order(symbol=self.symbol, orderId=order_id)
+            buy_price = self.buy_order_ids[order_id]
+            stop_loss_price = self.__get_stop_loss_price(buy_price)
+            if float(order['stopPrice']) != stop_loss_price:
+                self.client.cancel_order(symbol=self.symbol, orderId=order_id)
+                self.client.create_oco_order(
+                    symbol=self.symbol,
+                    quantity=order['origQty'],
+                    side=SIDE_SELL,
+                    stopPrice=str(stop_loss_price),
+                    price=str(self.__get_take_profit_price(buy_price)),
+                    stopLimitPrice=str(stop_loss_price),
+                    stopLimitTimeInForce=TIME_IN_FORCE_GTC
+                )
+                print(f"Stop loss order for {self.symbol} updated at {stop_loss_price}")
+        except BinanceAPIException as e:
+            print(f"Error updating stop loss order: {e}")
+    
+    def __update_rsi(self):
+        klines = self.client.get_historical_klines(self.symbol, self.interval,
+                 self.buy_order_ids[self.symbol] == order_id:
+                 print(f"Buy order placed for {self.symbol} at {buy_price}")
+                return True
+        except BinanceAPIException as e:
+                 print(f"Failed to place buy order for {self.symbol} - {e}")
+            return False
+
+    return False
+
+def __place_market_sell_order(self):
+    if self.symbol in self.buy_order_ids:
+        try:
+            order = self.client.order_market_sell(symbol=self.symbol, quantity=sell_qty)
+            sell_price = float(order['fills'][0]['price'])
+            print(f"Sell order placed for {self.symbol} at {sell_price}")
+            self.buy_order_ids.pop(self.symbol)
+            return True
+        except BinanceAPIException as e:
+            print(f"Failed to place sell order for {self.symbol} - {e}")
+            return False
+
+    return False
+
+def __is_buy_signal(self):
+    return self.__is_oversold() and self.current_prices[self.symbol] > self.bollinger_bands_lower[self.symbol] and self.running
+
+def __is_sell_signal(self):
+    return self.current_prices[self.symbol] < self.stop_loss * self.buy_order_ids[self.symbol]['price'] or \
+           self.current_prices[self.symbol] > self.take_profit * self.buy_order_ids[self.symbol]['price']
+
+def __is_oversold(self):
+    closes = np.array(self.kline_closes[self.symbol])
+    rsi = talib.RSI(closes, timeperiod=14)[-1]
+    return rsi < self.rsi_threshold
+
+def __calculate_bollinger_bands(self):
+    klines = self.client.get_historical_klines(self.symbol, self.interval, "1000 minutes ago UTC")
+    closes = [float(x[4]) for x in klines]
+    self.kline_closes = {self.symbol: closes}
+    sma = talib.SMA(np.array(closes), timeperiod=self.bollinger_bands_period)
+    std_dev = talib.STDDEV(np.array(closes), timeperiod=self.bollinger_bands_period, ddof=1)
+    self.bollinger_bands_upper = {self.symbol: sma + std_dev * self.std_dev_multiplier}
+    self.bollinger_bands_lower = {self.symbol: sma - std_dev * self.std_dev_multiplier}
+    self.bollinger_bands_middle = {self.symbol: sma}
+
+def __switch_pairs(self):
+    btc_close_price = float(self.client.get_klines(symbol="BTCUSDT", interval=self.interval)[-1][4])
+    eth_close_price = float(self.client.get_klines(symbol="ETHUSDT", interval=self.interval)[-1][4])
+    bnb_close_price = float(self.client.get_klines(symbol="BNBUSDT", interval=self.interval)[-1][4])
+
+    if self.current_prices[self.symbol] / btc_close_price > switch_profit_threshold and self.symbol != "BTCUSDT":
+        print(f"Switching to BTCUSDT")
+        self.stop()
+        bot = BinanceBot(api_key, api_secret, "BTCUSDT", interval, trade_allocation, stop_loss, take_profit)
+        bot.start()
+
+    if self.current_prices[self.symbol] / eth_close_price > switch_profit_threshold and self.symbol != "ETHUSDT":
+        print(f"Switching to ETHUSDT")
+        self.stop()
+        bot = BinanceBot(api_key, api_secret, "ETHUSDT", interval, trade_allocation, stop_loss, take_profit)
+        bot.start()
+
+    if self.current_prices[self.symbol] / bnb_close_price > switch_profit_threshold and self.symbol != "BNBUSDT":
+     print(f"Switching to B")
+
+                    self.stop_loss)
+                self.buy_order_ids[self.symbol] = response['orderId']
+                print(f"Placed buy order for {self.symbol} at market price: {close_price}")
+
+    try:
+        # check if there is an existing open order for the symbol
+        open_orders = self.client.get_open_orders(symbol=self.symbol)
+        if len(open_orders) > 0:
+            print(f"Existing open order found for {self.symbol}")
+            # cancel the open order and place a new buy order at the current market price
+            response = self.client.cancel_order(symbol=self.symbol, orderId=open_orders[0]['orderId'])
+            if response['status'] == 'CANCELED':
+                print(f"Canceled open order for {self.symbol}")
+                self.__place_market_buy_order()
+        else:
+            self.__place_market_buy_order()
+    except BinanceAPIException as e:
+        print(e)
+
+def __place_market_sell_order(self):
+    try:
+        close_price = self.current_prices[self.symbol]
+        order_qty = self.trade_allocation / close_price
+        response = self.client.create_order(
+            symbol=self.symbol,
+            side=SIDE_SELL,
+            type=ORDER_TYPE_MARKET,
+            quantity=format(order_qty, "f"),
+            stopPrice=format(close_price * self.stop_loss, "f"),
+            price=format(close_price * self.take_profit, "f"),
+            timeInForce=TIME_IN_FORCE_GTC
+        )
+        print(f"Placed sell order for {self.symbol} at market price: {close_price}")
+    except BinanceAPIException as e:
+        print(e)
+
+def __is_buy_signal(self):
+    if self.symbol not in self.current_prices:
+        return False
+
+    current_price = self.current_prices[self.symbol]
+
+    # check if the current price is below the lower bollinger band
+    if current_price < self.bollinger_bands_lower:
+        return True
+
+    # check if the short-term moving average is above the long-term moving average
+    ma_short = self.__calculate_simple_moving_average(self.symbol, self.interval, self.sma_period)
+    ma_long = self.__calculate_simple_moving_average(self.symbol, self.interval, self.sma_period * 2)
+    if ma_short > ma_long:
+        return True
+
+    return False
+
+def __is_sell_signal(self):
+    if self.symbol not in self.current_prices:
+        return False
+
+    current_price = self.current_prices[self.symbol]
+
+    # check if the current price is above the upper bollinger band
+    if current_price > self.bollinger_bands_upper:
+        return True
+
+    # check if the RSI is above a certain threshold
+    rsi = self.__calculate_rsi(self.symbol, self.interval, self.rsi_threshold)
+    if rsi > self.rsi_threshold:
+        return True
+
+    return False
+
+def __calculate_simple_moving_average(self, symbol, interval, period):
+    klines = self.client.get_klines(symbol=symbol, interval=interval, limit=period)
+    close_prices = np.array([float(kline[4]) for kline in klines])
+    return talib.SMA(close_prices, timeperiod=period)[-1]
+
+def __calculate_bollinger_bands(self):
+    klines = self.client.get_klines(symbol=self.symbol, interval=self.interval, limit=self.bollinger_bands_period)
+    close_prices = np.array([float(kline[4]) for kline in klines])
+    upper_band, middle_band, lower_band = talib.BBANDS(close_prices, timeperiod=self.bollinger_bands_period,
+                                                       nbdevup=self.std_dev_multiplier,
+                                                       nbdevdn=self.std_dev_multiplier, mat
+                self.__cancel_buy_order(buy_order_id)
+                self.__place_market_sell_order()
+        else:
+            print(f"Received an error: {msg['m']}")
+
+    self.bsm.start_user_socket(process_user_data)
+    self.bsm.start()
+
+def __place_market_buy_order(self):
+    try:
+        buy_order = self.client.order_market_buy(symbol=self.symbol, quantity=self.trade_allocation)
+        self.buy_order_ids[self.symbol] = buy_order['orderId']
+    except BinanceAPIException as e:
+        print(f"Failed to place buy order for {self.symbol}. Error message: {e}")
+
+def __place_market_sell_order(self):
+    try:
+        sell_order = self.client.order_market_sell(symbol=self.symbol, quantity=self.trade_allocation)
+        self.buy_order_ids.pop(self.symbol, None)
+    except BinanceAPIException as e:
+        print(f"Failed to place sell order for {self.symbol}. Error message: {e}")
+
+def __cancel_buy_order(self, order_id):
+    try:
+        self.client.cancel_order(symbol=self.symbol, orderId=order_id)
+    except BinanceAPIException as e:
+        print(f"Failed to cancel buy order {order_id} for {self.symbol}. Error message: {e}")
+
+def __calculate_bollinger_bands(self):
+    klines = self.client.get_historical_klines(self.symbol, self.interval, "1 day ago UTC")
+    closes = np.array([float(kline[4]) for kline in klines])
+    sma = talib.SMA(closes, timeperiod=self.bollinger_bands_period)
+    std_dev = talib.STDDEV(closes, timeperiod=self.bollinger_bands_period)
+    self.bollinger_bands_upper = sma + self.std_dev_multiplier * std_dev
+    self.bollinger_bands_lower = sma - self.std_dev_multiplier * std_dev
+    self.bollinger_bands_middle = sma
+
+def __is_buy_signal(self):
+    rsi = talib.RSI(self.current_prices[self.symbol], timeperiod=14)
+    if rsi is None:
+        return False
+    if rsi[-1] <= self.rsi_threshold and self.current_prices[self.symbol] < self.bollinger_bands_lower[-1]:
+        return True
+    return False
+
+def __is_sell_signal(self):
+    if self.symbol not in self.buy_order_ids:
+        return False
+    if self.current_prices[self.symbol] > self.bollinger_bands_upper[-1] or self.current_prices[
+        self.symbol] < self.bollinger_bands_middle[-1]:
+        return True
+    return False
+def main():
+bot = BinanceBot(api_key, api_secret, "BTCUSDT", Client.KLINE_INTERVAL_1MINUTE, buy_qty, stop_loss_threshold,
+profit_threshold)
+bot.start()
+while bot.running:
+continue
+bot.stop()
+
+if name == 'main':
+main()
+    def __calculate_bollinger_bands(self):
+        historical_klines = self.client.get_historical_klines(self.symbol, self.interval, "500 minutes ago UTC")
+        closes = np.array([float(k[4]) for k in historical_klines])
+        self.bollinger_bands_middle = talib.SMA(closes, self.bollinger_bands_period)
+        std_dev = talib.STDDEV(closes, self.bollinger_bands_period)
+        self.bollinger_bands_upper = self.bollinger_bands_middle + self.std_dev_multiplier * std_dev
+        self.bollinger_bands_lower = self.bollinger_bands_middle - self.std_dev_multiplier * std_dev
+
+    def __is_buy_signal(self):
+        current_price = self.current_prices[self.symbol]
+        bb_upper = self.bollinger_bands_upper[-1]
+        bb_middle = self.bollinger_bands_middle[-1]
+        bb_lower = self.bollinger_bands_lower[-1]
+        if current_price < bb_lower:
+            return True
+        if current_price > bb_upper:
+            return False
+        if current_price > bb_middle:
+            return True
+        return False
+
+    def __is_sell_signal(self):
+        current_price = self.current_prices[self.symbol]
+        if current_price >= self.take_profit:
+            return True
+        if current_price <= self.stop_loss:
+            return True
+        return False
+
+    def __place_market_buy_order(self):
+        print(f"Placing buy order for {self.symbol} at market price")
+        try:
+            order = self.client.order_market_buy(
+                symbol=self.symbol,
+                quantity=self.trade_allocation,
+            )
+            self.buy_order_ids[self.symbol] = order['orderId']
+        except BinanceAPIException as e:
+            print(f"Failed to place buy order for {self.symbol}: {e}")
+        except BinanceOrderException as e:
+            print(f"Failed to place buy order for {self.symbol}: {e}")
+
+    def __place_market_sell_order(self):
+        print(f"Placing sell order for {self.symbol} at market price")
+        try:
+            order = self.client.order_market_sell(
+                symbol=self.symbol,
+                quantity=self.trade_allocation,
+            )
+            self.buy_order_ids.pop(self.symbol, None)
+        except BinanceAPIException as e:
+            print(f"Failed to place sell order for {self.symbol}: {e}")
+        except BinanceOrderException as e:
+            print(f"Failed to place sell order for {self.symbol}: {e}")
+
+    def __cancel_all_buy_orders(self):
+        print(f"Cancelling all open buy orders for {self.symbol}")
+        for order_id in self.buy_order_ids.values():
+            try:
+                self.client.cancel_order(
+                    symbol=self.symbol,
+                    orderId=order_id
+                )
+            except BinanceAPIException as e:
+                print(f"Failed to cancel order {order_id} for {self.symbol}: {e}")
+            except BinanceOrderException as e:
+                print(f"Failed to cancel order {order_id} for {self.symbol}: {e}")
+
+    def __is_switch_signal(self):
+        symbol_prices = self.current_prices.values()
+        if len(symbol_prices) < 2:
+            return False
+        current_symbol_price = self.current_prices[self.symbol]
+        other_symbol_prices = [price for symbol, price in self.current_prices.items() if symbol != self.symbol]
+        other_symbol_mean = np.mean(other_symbol_prices)
+        if current_symbol_price >= self.take_profit:
+            return False
+        if current_symbol_price <= self.stop_loss:
+            return False
+        if current_symbol_price >= other_symbol_mean * self.switch_profit_threshold:
+            return True
+        return False
+    def __place_market_sell_order(self):
+        current_price = self.current_prices[self.symbol]
+        sell_price = current_price * self.take_profit
+        stop_loss_price = current_price * self.stop_loss
+        quantity = self.trade_allocation / current_price
+        try:
+            order = self.client.create_order(
+                symbol=self.symbol,
+                side=SIDE_SELL,
+                type=ORDER_TYPE_TAKE_PROFIT,
+                stopPrice=stop_loss_price,
+                price=sell_price,
+                quantity=quantity,
+                timeInForce=TIME_IN_FORCE_GTC)
+            self.buy_order_ids.pop(self.symbol, None)
+            print(f"Placed market sell order for {self.symbol} at {sell_price}")
+        except BinanceAPIException as e:
+            print(f"Failed to place market sell order for {self.symbol}: {e}")
+
+    def __place_market_buy_order(self):
+        current_price = self.current_prices[self.symbol]
+        buy_price = current_price * self.take_profit
+        quantity = self.trade_allocation / current_price
+        try:
+            order = self.client.create_order(
+                symbol=self.symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_TAKE_PROFIT_LIMIT,
+                price=buy_price,
+                stopPrice=current_price,
+                quantity=quantity,
+                timeInForce=TIME_IN_FORCE_GTC)
+            self.buy_order_ids[self.symbol] = order['orderId']
+            print(f"Placed market buy order for {self.symbol} at {buy_price}")
+        except BinanceAPIException as e:
+            print(f"Failed to place market buy order for {self.symbol}: {e}")
+
+    def __calculate_bollinger_bands(self):
+        historical_prices = self.client.get_historical_klines(
+            self.symbol, self.interval, "1 day ago UTC")
+        close_prices = [float(price[4]) for price in historical_prices]
+        np_prices = np.array(close_prices)
+        self.bollinger_bands_upper, self.bollinger_bands_middle, self.bollinger_bands_lower = talib.BBANDS(
+            np_prices, timeperiod=self.bollinger_bands_period, nbdevup=self.std_dev_multiplier, nbdevdn=self.std_dev_multiplier, matype=0)
+
+    def __is_buy_signal(self):
+        current_price = self.current_prices[self.symbol]
+        if self.buy_order_ids.get(self.symbol):
+            return False
+        if current_price < self.bollinger_bands_lower[-1] and current_price > self.bollinger_bands_middle[-1]:
+            rsi = talib.RSI(self.client.get_historical_klines(
+                self.symbol, self.interval, "7 days ago UTC"), timeperiod=14)
+            if rsi[-1] < self.rsi_threshold:
+                return True
+        return False
+
+    def __is_sell_signal(self):
+        current_price = self.current_prices[self.symbol]
+        buy_order_id = self.buy_order_ids.get(self.symbol)
+        if buy_order_id:
+            order = self.client.get_order(symbol=self.symbol, orderId=buy_order_id)
+            if order['status'] == "FILLED":
+                return current_price > (order['price'] * self.profit_threshold)
+            else:
+                return current_price < order['stopPrice']
+        return False
+
+    def __calculate_bollinger_bands(self):
+        klines = self.client.get_historical_klines(self.symbol, self.interval, "1000 minutes ago UTC")
+        close_prices = np.array([float(kline[4]) for kline in klines])
+        self.bollinger_bands_middle = talib.SMA(close_prices, timeperiod=self.bollinger_bands_period)
+        std_dev = talib.STDDEV(close_prices, timeperiod=self.bollinger_bands_period)
+        self.bollinger_bands_upper = self.bollinger_bands_middle + self.std_dev_multiplier * std_dev
+        self.bollinger_bands_lower = self.bollinger_bands_middle - self.std_dev_multiplier * std_dev
+
+    def __is_sell_signal(self):
+        if self.current_prices[self.symbol] <= self.bollinger_bands_lower[-1] or \
+                self.current_prices[self.symbol] >= self.take_profit:
+            return True
+        return False
+
+    def __is_buy_signal(self):
+        if self.current_prices[self.symbol] >= self.bollinger_bands_upper[-1] or \
+                self.current_prices[self.symbol] <= self.stop_loss:
+            return True
+        return False
+
+    def __place_market_sell_order(self):
+        if self.buy_order_ids.get(self.symbol) is not None:
+            buy_order_id = self.buy_order_ids[self.symbol]
+            try:
+                order = self.client.get_order(symbol=self.symbol, orderId=buy_order_id)
+                if order['status'] == 'FILLED':
+                    buy_price = float(order['fills'][0]['price'])
+                    sell_qty = float(order['executedQty'])
+                    sell_price = self.current_prices[self.symbol]
+                    order = self.client.create_order(
+                        symbol=self.symbol,
+                        side=SIDE_SELL,
+                        type=ORDER_TYPE_MARKET,
+                        quantity=sell_qty,
+                        quoteOrderQty=None,
+                        price=sell_price,
+                        newClientOrderId=None,
+                        stopPrice=None,
+                        icebergQty=None,
+                        newOrderRespType=None,
+                        recvWindow=None,
+                        timeInForce=None
+                    )
+                    self.buy_order_ids[self.symbol] = None
+                    print(f"Sold {sell_qty} {self.symbol} for {sell_price} (bought for {buy_price})")
+            except BinanceAPIException as e:
+                print(f"An exception occurred while placing a sell order for {self.symbol}: {e}")
+        else:
+            print(f"No buy order exists for {self.symbol}")
+
+    def __place_market_buy_order(self):
+        if self.buy_order_ids.get(self.symbol) is None:
+            try:
+                order = self.client.create_order(
+                    symbol=self.symbol,
+                    side=SIDE_BUY,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=self.trade_allocation/self.current_prices[self.symbol],
+                    quoteOrderQty=self.trade_allocation,
+                    price=None,
+                    newClientOrderId=None,
+                    stopPrice=None,
+                    icebergQty=None,
+                    newOrderRespType=None,
+                    recvWindow=None,
+                    timeInForce=None
+                )
+                buy_price = float(order['fills'][0]['price'])
+                buy_qty = float(order['executedQty'])
+                self.buy_order_ids[self.symbol] = order['orderId']
+                print(f"Bought {buy_qty} {self.symbol} for {buy_price}")
+            except BinanceAPIException as e:
+                print(f"An exception occurred while placing a buy order for {self.symbol}: {e}")
+        else:
+            print(f"Buy order already exists for {self.symbol}")
